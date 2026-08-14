@@ -178,6 +178,12 @@ footer{border-top:1px solid var(--line);padding:24px;text-align:center;color:var
 }
 .modal-actions button:disabled{opacity:.6;cursor:default;}
 .modal-actions button:hover:not(:disabled){background:#67e0d4;}
+
+.mod-item{border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:12px;background:var(--bg-panel);}
+.mod-item h5{margin:0 0 6px;font-size:14.5px;}
+.mod-item .mod-meta{font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:8px;}
+.mod-item p{margin:0;font-size:13.5px;line-height:1.5;color:var(--text);}
+.mod-empty{color:var(--text-dim);font-family:var(--font-mono);font-size:13px;font-style:italic;padding:8px 0 18px;}
 </style>
 </head>
 <body>
@@ -220,6 +226,7 @@ footer{border-top:1px solid var(--line);padding:24px;text-align:center;color:var
   BugLog — journal communautaire de pannes & correctifs · fait pour dépanner vite
   <div class="contact-bar">
     <button type="button" id="openContact" class="contact-open-btn">✉ Nous contacter</button>
+    <button type="button" id="openHistory" class="contact-open-btn">🕘 Mon historique</button>
   </div>
 </footer>
 
@@ -246,6 +253,20 @@ footer{border-top:1px solid var(--line);padding:24px;text-align:center;color:var
         <button type="submit" id="contactSubmitBtn">Envoyer</button>
       </div>
     </form>
+  </div>
+</div>
+
+<div class="modal-overlay" id="historyModal">
+  <div class="modal-box" style="max-width:520px;">
+    <div class="modal-head">
+      <h3>Historique de mes commentaires</h3>
+      <button type="button" class="modal-close" id="closeHistoryModal">&times;</button>
+    </div>
+    <form id="historySearchForm" style="display:flex;gap:8px;margin-bottom:16px;">
+      <input type="text" id="historyNameInput" placeholder="Ton prénom (tel qu'utilisé dans tes commentaires)" style="flex:1;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:var(--font-sans);font-size:14px;padding:9px 12px;outline:none;">
+      <button type="submit" style="font-family:var(--font-mono);font-size:12.5px;font-weight:600;background:var(--accent);color:#04201d;border:none;border-radius:6px;padding:9px 16px;cursor:pointer;">Voir</button>
+    </form>
+    <div id="historyContent"></div>
   </div>
 </div>
 
@@ -418,11 +439,26 @@ function updateBadgeFromKey(key, count){
   if(badge) badge.textContent = `💬 ${count}`;
 }
 
+function historyKey(name){
+  return `history:${String(name).trim().toLowerCase()}`;
+}
+
+async function addToHistory(name, entry){
+  try{
+    const hKey = historyKey(name);
+    const res = await window.storage.get(hKey, true).catch(()=>null);
+    const hist = (res && res.value) ? JSON.parse(res.value) : [];
+    hist.push(entry);
+    await window.storage.set(hKey, JSON.stringify(hist), true);
+  }catch(e){ /* non-bloquant */ }
+}
+
 function escapeHtml(s){
+  if(s === null || s === undefined) return '';
   return String(s).replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 }
 function fmtShort(iso){
-  try{ return new Date(iso).toLocaleDateString('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); }catch(e){ return ''; }
+  try{ return new Date(iso).toLocaleString('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); }catch(e){ return ''; }
 }
 function stripHtml(html){
   const tmp = document.createElement('div');
@@ -517,12 +553,14 @@ async function initComments(key, articleContext){
     btn.disabled = true; btn.textContent = 'Publication…';
     try{
       const current = await fetchItems();
-      current.push({name, text, date: new Date().toISOString()});
+      const nowIso = new Date().toISOString();
+      current.push({name, text, date: nowIso});
       await window.storage.set(storageKey, JSON.stringify(current), true);
       nameInput.value = ''; textInput.value = '';
       renderList(current);
       updateBadgeFromKey(key, current.length);
       btn.disabled = false; btn.textContent = 'Publier';
+      addToHistory(name, {type:'article', ref: key.replace('article:',''), titre: articleContext ? articleContext.titre : '', text, date: nowIso});
 
       if(articleContext){
         appendThinking();
@@ -594,6 +632,42 @@ contactForm.addEventListener('submit', async (e)=>{
     alert("Impossible d'envoyer le message pour le moment. Réessayez plus tard.");
   }finally{
     btn.disabled = false; btn.textContent = 'Envoyer';
+  }
+});
+
+/* ---------- HISTORIQUE DES COMMENTAIRES ---------- */
+const historyModal = document.getElementById('historyModal');
+document.getElementById('openHistory').addEventListener('click', ()=>{
+  document.getElementById('historyContent').innerHTML = '';
+  document.getElementById('historyNameInput').value = '';
+  historyModal.classList.add('open');
+  setTimeout(()=> document.getElementById('historyNameInput').focus(), 50);
+});
+document.getElementById('closeHistoryModal').addEventListener('click', ()=> historyModal.classList.remove('open'));
+historyModal.addEventListener('click', e=>{ if(e.target === historyModal) historyModal.classList.remove('open'); });
+
+document.getElementById('historySearchForm').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const name = document.getElementById('historyNameInput').value.trim();
+  const content = document.getElementById('historyContent');
+  if(!name) return;
+  content.innerHTML = '<div class="mod-empty">Recherche…</div>';
+  try{
+    const res = await window.storage.get(historyKey(name), true);
+    const hist = (res && res.value) ? JSON.parse(res.value) : [];
+    if(!hist.length){
+      content.innerHTML = '<div class="mod-empty">Aucun commentaire trouvé pour ce nom.</div>';
+      return;
+    }
+    const sorted = [...hist].sort((a,b)=> new Date(b.date) - new Date(a.date));
+    content.innerHTML = sorted.map(h=>`
+      <div class="mod-item">
+        <h5>${escapeHtml(h.titre || (h.type==='bug' ? 'Fiche bug' : 'Article'))}</h5>
+        <div class="mod-meta">${h.type==='bug' ? 'Base de bugs' : 'Blog'} · ${fmtShort(h.date)}</div>
+        <p>${escapeHtml(h.text)}</p>
+      </div>`).join('');
+  }catch(err){
+    content.innerHTML = '<div class="mod-empty">Impossible de charger l\'historique pour le moment.</div>';
   }
 });
 </script>

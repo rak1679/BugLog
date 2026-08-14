@@ -320,6 +320,28 @@ footer{
   </div>
 </nav>
 
+<div class="modal-overlay" id="loginModal">
+  <div class="modal-box" style="max-width:380px;">
+    <div class="modal-head">
+      <h3>Connexion admin</h3>
+      <button type="button" class="modal-close" id="closeLoginModal">&times;</button>
+    </div>
+    <form id="loginForm">
+      <div class="field">
+        <label>Mot de passe</label>
+        <input type="password" name="pwd" autocomplete="current-password" required>
+      </div>
+      <div class="field">
+        <label>Code de l'application d'authentification</label>
+        <input type="text" name="otp" inputmode="numeric" maxlength="6" autocomplete="one-time-code" required placeholder="123456">
+      </div>
+      <div class="modal-actions">
+        <button type="submit">Se connecter</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <div class="hero">
   <div class="boot" id="boot"></div>
   <h1 class="title"><span class="bracket">[</span>BugLog<span class="bracket">]</span> — pannes & correctifs</h1>
@@ -449,6 +471,7 @@ footer{
   BugLog — journal communautaire de pannes & correctifs · fait pour dépanner vite
   <div class="contact-bar">
     <button type="button" id="openContact" class="contact-open-btn">✉ Nous contacter</button>
+    <button type="button" id="openHistory" class="contact-open-btn">🕘 Mon historique</button>
   </div>
 </footer>
 
@@ -475,6 +498,20 @@ footer{
         <button type="submit" id="contactSubmitBtn">Envoyer</button>
       </div>
     </form>
+  </div>
+</div>
+
+<div class="modal-overlay" id="historyModal">
+  <div class="modal-box" style="max-width:520px;">
+    <div class="modal-head">
+      <h3>Historique de mes commentaires</h3>
+      <button type="button" class="modal-close" id="closeHistoryModal">&times;</button>
+    </div>
+    <form id="historySearchForm" style="display:flex;gap:8px;margin-bottom:16px;">
+      <input type="text" id="historyNameInput" placeholder="Ton prénom (tel qu'utilisé dans tes commentaires)" style="flex:1;background:#0d1728;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:var(--font-sans);font-size:14px;padding:9px 12px;outline:none;">
+      <button type="submit" style="font-family:var(--font-mono);font-size:12.5px;font-weight:600;background:var(--accent);color:#04201d;border:none;border-radius:6px;padding:9px 16px;cursor:pointer;">Voir</button>
+    </form>
+    <div id="historyContent"></div>
   </div>
 </div>
 
@@ -542,6 +579,9 @@ let pendingEdits = {};
 let isAdmin = false;
 
 const ADMIN_PASSWORD = "buglog-admin"; // ⚠ à changer avant de publier le site
+// ⚠ Secret TOTP unique pour l'authentificateur (Google Authenticator, Authy, Microsoft Authenticator…)
+// À saisir manuellement dans l'app avant de pouvoir se connecter. Ne pas partager.
+const TOTP_SECRET = "DUI24WVJIEMYSWXV";
 const CUSTOM_KEY = "custom-bugs";
 const OVERRIDES_KEY = "bug-overrides";
 const PENDING_BUGS_KEY = "pending-bugs";
@@ -578,6 +618,44 @@ async function loadContributions(){
   }catch(e){ contactMessages = []; }
 }
 
+/* ---------- TOTP (compatible Google Authenticator / Authy / Microsoft Authenticator) ---------- */
+function base32Decode(base32){
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for(const c of base32.replace(/=+$/,'').toUpperCase()){
+    const val = alphabet.indexOf(c);
+    if(val === -1) continue;
+    bits += val.toString(2).padStart(5,'0');
+  }
+  const bytes = [];
+  for(let i=0;i+8<=bits.length;i+=8){
+    bytes.push(parseInt(bits.substr(i,8),2));
+  }
+  return new Uint8Array(bytes);
+}
+
+async function generateTOTP(secretBase32, offsetSteps=0, timeStep=30, digits=6){
+  const key = base32Decode(secretBase32);
+  const counter = Math.floor(Date.now()/1000/timeStep) + offsetSteps;
+  const buffer = new ArrayBuffer(8);
+  const view = new DataView(buffer);
+  view.setUint32(0, Math.floor(counter / 0x100000000));
+  view.setUint32(4, counter >>> 0);
+  const cryptoKey = await crypto.subtle.importKey("raw", key, {name:"HMAC", hash:"SHA-1"}, false, ["sign"]);
+  const hmac = new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, buffer));
+  const offsetByte = hmac[hmac.length-1] & 0xf;
+  const binCode = ((hmac[offsetByte] & 0x7f) << 24) | ((hmac[offsetByte+1] & 0xff) << 16) |
+                  ((hmac[offsetByte+2] & 0xff) << 8) | (hmac[offsetByte+3] & 0xff);
+  return String(binCode % (10 ** digits)).padStart(digits, '0');
+}
+
+async function verifyTOTP(secretBase32, code){
+  for(const offset of [-1, 0, 1]){ // tolère 30s d'écart avant/après
+    if(await generateTOTP(secretBase32, offset) === code) return true;
+  }
+  return false;
+}
+
 function pendingCount(){
   return pendingBugs.length + Object.keys(pendingEdits).length;
 }
@@ -600,6 +678,15 @@ function updateModBtn(){
   }
 }
 
+function inferVcat(version){
+  if(!version) return null;
+  const v = version.toLowerCase();
+  if(v.includes('server')) return 'server';
+  if(v.includes('xp') || v.includes('vista') || /\b7\b/.test(v)) return 'legacy';
+  if(v.includes('8') || v.includes('10') || v.includes('11')) return 'modern';
+  return null;
+}
+
 function sevRank(s){return {critique:0,moyen:1,mineur:2}[s] ?? 3;}
 
 function render(){
@@ -607,8 +694,15 @@ function render(){
   let list = getAllBugs().filter(b=>{
     if(state.cat!=="tous" && b.cat!==state.cat) return false;
     if(state.os!=="tous" && b.os!==state.os) return false;
-    if(state.version!=="tous" && b.vcat && b.vcat!==state.version) return false;
-    if(q && !(b.titre.toLowerCase().includes(q) || b.code.toLowerCase().includes(q) || b.desc.toLowerCase().includes(q) || (b.version||"").toLowerCase().includes(q))) return false;
+    if(state.version!=="tous"){
+      const effVcat = b.vcat || inferVcat(b.version);
+      if(effVcat && effVcat!==state.version) return false;
+    }
+    if(q){
+      const titre=(b.titre||"").toLowerCase(), code=(b.code||"").toLowerCase(),
+            desc=(b.desc||"").toLowerCase(), ver=(b.version||"").toLowerCase();
+      if(!(titre.includes(q) || code.includes(q) || desc.includes(q) || ver.includes(q))) return false;
+    }
     return true;
   });
   list.sort((a,b)=>sevRank(a.gravite)-sevRank(b.gravite));
@@ -624,10 +718,10 @@ function render(){
     el.className = 'log';
     el.innerHTML = `
       <div class="log-head">
-        <span class="sev ${b.gravite}" title="${b.gravite}"></span>
-        <span class="log-code">${b.code}</span>
-        <span class="log-title">${b.titre}</span>
-        <span class="log-tags"><span class="tag">${b.cat}</span><span class="tag">${b.os}</span>${b.version?`<span class="tag">${b.version}</span>`:''}${(isAdmin && pendingEdits[b.id])?'<span class="pending-tag">modif. en attente</span>':''}</span>
+        <span class="sev ${b.gravite}" title="${escapeHtml(b.gravite)}"></span>
+        <span class="log-code">${escapeHtml(b.code)}</span>
+        <span class="log-title">${escapeHtml(b.titre)}</span>
+        <span class="log-tags"><span class="tag">${escapeHtml(b.cat)}</span><span class="tag">${escapeHtml(b.os)}</span>${b.version?`<span class="tag">${escapeHtml(b.version)}</span>`:''}${(isAdmin && pendingEdits[b.id])?'<span class="pending-tag">modif. en attente</span>':''}</span>
         <span class="c-badge" id="c-badge-${b.id}">💬 …</span>
         <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
       </div>
@@ -635,11 +729,11 @@ function render(){
         <div class="log-body-inner">
           <div>
             <h4>Symptôme</h4>
-            <p>${b.desc}</p>
+            <p>${escapeHtml(b.desc)}</p>
           </div>
           <div class="fix">
             <h4>Correctif</h4>
-            <p>${b.fix}</p>
+            <p>${escapeHtml(b.fix)}</p>
           </div>
           <div class="edit-row">
             <button type="button" class="edit-btn" style="${isAdmin?'display:inline-block;':''}">✎ Modifier cette fiche</button>
@@ -695,11 +789,26 @@ function updateBadgeFromKey(key, count){
   if(badge) badge.textContent = `💬 ${count}`;
 }
 
+function historyKey(name){
+  return `history:${String(name).trim().toLowerCase()}`;
+}
+
+async function addToHistory(name, entry){
+  try{
+    const hKey = historyKey(name);
+    const res = await window.storage.get(hKey, true).catch(()=>null);
+    const hist = (res && res.value) ? JSON.parse(res.value) : [];
+    hist.push(entry);
+    await window.storage.set(hKey, JSON.stringify(hist), true);
+  }catch(e){ /* non-bloquant */ }
+}
+
 function escapeHtml(s){
+  if(s === null || s === undefined) return '';
   return String(s).replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 }
 function fmtShort(iso){
-  try{ return new Date(iso).toLocaleDateString('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); }catch(e){ return ''; }
+  try{ return new Date(iso).toLocaleString('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); }catch(e){ return ''; }
 }
 
 async function getAIReply(context, comment){
@@ -784,12 +893,14 @@ async function initComments(key, container, bugContext){
     btn.disabled = true; btn.textContent = 'Publication…';
     try{
       const current = await fetchItems();
-      current.push({name, text, date: new Date().toISOString()});
+      const nowIso = new Date().toISOString();
+      current.push({name, text, date: nowIso});
       await window.storage.set(storageKey, JSON.stringify(current), true);
       nameInput.value = ''; textInput.value = '';
       renderList(current);
       updateBadgeFromKey(key, current.length);
       btn.disabled = false; btn.textContent = 'Publier';
+      addToHistory(name, {type:'bug', ref: key.replace('bug:',''), titre: bugContext ? bugContext.titre : '', text, date: nowIso});
 
       if(bugContext){
         appendThinking();
@@ -937,24 +1048,50 @@ function openEditModal(b){
 })();
 
 /* ---------- ADMIN LOGIN ---------- */
+const loginModal = document.getElementById('loginModal');
+const loginForm = document.getElementById('loginForm');
+
 document.getElementById('adminBtn').addEventListener('click', ()=>{
   if(isAdmin){
     isAdmin = false;
     document.getElementById('adminBtn').textContent = "Connexion admin";
     document.getElementById('adminBtn').classList.remove('active');
+    updateModBtn();
+    render();
   }else{
-    const pwd = prompt("Mot de passe administrateur :");
-    if(pwd === null) return;
-    if(pwd === ADMIN_PASSWORD){
-      isAdmin = true;
-      document.getElementById('adminBtn').textContent = "Admin ✓ (déconnexion)";
-      document.getElementById('adminBtn').classList.add('active');
-    }else{
-      alert("Mot de passe incorrect.");
-    }
+    loginForm.reset();
+    loginModal.classList.add('open');
+    setTimeout(()=> loginForm.pwd.focus(), 50);
   }
-  updateModBtn();
-  render();
+});
+document.getElementById('closeLoginModal').addEventListener('click', ()=> loginModal.classList.remove('open'));
+loginModal.addEventListener('click', e=>{ if(e.target === loginModal) loginModal.classList.remove('open'); });
+
+loginForm.addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const pwd = loginForm.pwd.value;
+  const otp = loginForm.otp.value.trim();
+  const submitBtn = loginForm.querySelector('button[type="submit"]');
+  submitBtn.disabled = true; submitBtn.textContent = 'Vérification…';
+  try{
+    if(pwd !== ADMIN_PASSWORD){
+      alert("Mot de passe incorrect.");
+      return;
+    }
+    const validOtp = await verifyTOTP(TOTP_SECRET, otp);
+    if(!validOtp){
+      alert("Code d'authentification incorrect. Vérifie l'heure de ton téléphone et réessaie.");
+      return;
+    }
+    isAdmin = true;
+    document.getElementById('adminBtn').textContent = "Admin ✓ (déconnexion)";
+    document.getElementById('adminBtn').classList.add('active');
+    loginModal.classList.remove('open');
+    updateModBtn();
+    render();
+  }finally{
+    submitBtn.disabled = false; submitBtn.textContent = 'Se connecter';
+  }
 });
 
 /* ---------- MODERATION PANEL ---------- */
@@ -977,10 +1114,10 @@ function renderModPanel(){
     pendingBugs.forEach(b=>{
       html += `
         <div class="mod-item">
-          <h5>${b.titre}</h5>
-          <div class="mod-meta">${b.cat} · ${b.os}${b.version?' · '+b.version:''} · ${b.code}</div>
-          <p><strong>Symptôme :</strong> ${b.desc}</p>
-          <p><strong>Correctif :</strong> ${b.fix}</p>
+          <h5>${escapeHtml(b.titre)}</h5>
+          <div class="mod-meta">${escapeHtml(b.cat)} · ${escapeHtml(b.os)}${b.version?' · '+escapeHtml(b.version):''} · ${escapeHtml(b.code)}</div>
+          <p><strong>Symptôme :</strong> ${escapeHtml(b.desc)}</p>
+          <p><strong>Correctif :</strong> ${escapeHtml(b.fix)}</p>
           <div class="mod-actions">
             <button class="mod-approve" data-action="approve-new" data-id="${b.id}">Approuver</button>
             <button class="mod-reject" data-action="reject-new" data-id="${b.id}">Rejeter</button>
@@ -999,10 +1136,10 @@ function renderModPanel(){
       const original = getAllBugs().find(b=>b.id===id);
       html += `
         <div class="mod-item">
-          <h5>${d.titre}</h5>
-          <div class="mod-meta">Modification proposée pour : ${original ? original.titre : id}</div>
-          <p><strong>Symptôme :</strong> ${d.desc}</p>
-          <p><strong>Correctif :</strong> ${d.fix}</p>
+          <h5>${escapeHtml(d.titre)}</h5>
+          <div class="mod-meta">Modification proposée pour : ${escapeHtml(original ? original.titre : id)}</div>
+          <p><strong>Symptôme :</strong> ${escapeHtml(d.desc)}</p>
+          <p><strong>Correctif :</strong> ${escapeHtml(d.fix)}</p>
           <div class="mod-actions">
             <button class="mod-approve" data-action="approve-edit" data-id="${id}">Approuver</button>
             <button class="mod-reject" data-action="reject-edit" data-id="${id}">Rejeter</button>
@@ -1084,6 +1221,42 @@ contactForm.addEventListener('submit', async (e)=>{
     alert("Impossible d'envoyer le message pour le moment. Réessayez plus tard.");
   }finally{
     btn.disabled = false; btn.textContent = 'Envoyer';
+  }
+});
+
+/* ---------- HISTORIQUE DES COMMENTAIRES ---------- */
+const historyModal = document.getElementById('historyModal');
+document.getElementById('openHistory').addEventListener('click', ()=>{
+  document.getElementById('historyContent').innerHTML = '';
+  document.getElementById('historyNameInput').value = '';
+  historyModal.classList.add('open');
+  setTimeout(()=> document.getElementById('historyNameInput').focus(), 50);
+});
+document.getElementById('closeHistoryModal').addEventListener('click', ()=> historyModal.classList.remove('open'));
+historyModal.addEventListener('click', e=>{ if(e.target === historyModal) historyModal.classList.remove('open'); });
+
+document.getElementById('historySearchForm').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const name = document.getElementById('historyNameInput').value.trim();
+  const content = document.getElementById('historyContent');
+  if(!name) return;
+  content.innerHTML = '<div class="mod-empty">Recherche…</div>';
+  try{
+    const res = await window.storage.get(historyKey(name), true);
+    const hist = (res && res.value) ? JSON.parse(res.value) : [];
+    if(!hist.length){
+      content.innerHTML = '<div class="mod-empty">Aucun commentaire trouvé pour ce nom.</div>';
+      return;
+    }
+    const sorted = [...hist].sort((a,b)=> new Date(b.date) - new Date(a.date));
+    content.innerHTML = sorted.map(h=>`
+      <div class="mod-item">
+        <h5>${escapeHtml(h.titre || (h.type==='bug' ? 'Fiche bug' : 'Article'))}</h5>
+        <div class="mod-meta">${h.type==='bug' ? 'Base de bugs' : 'Blog'} · ${fmtShort(h.date)}</div>
+        <p>${escapeHtml(h.text)}</p>
+      </div>`).join('');
+  }catch(err){
+    content.innerHTML = '<div class="mod-empty">Impossible de charger l\'historique pour le moment.</div>';
   }
 });
 
